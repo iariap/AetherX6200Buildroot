@@ -1,0 +1,5 @@
+config BR2_PACKAGE_RTW88
+	bool "rtw88"
+	depends on BR2_LINUX_KERNEL
+	help
+	  rtw88 WiFi linux driver
