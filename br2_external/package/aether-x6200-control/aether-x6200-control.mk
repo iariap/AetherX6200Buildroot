@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-AETHER_X6200_CONTROL_VERSION = v0.1.0
+AETHER_X6200_CONTROL_VERSION = v0.1.1
 AETHER_X6200_CONTROL_SITE = https://github.com/gdyuldin/X6200Control
 AETHER_X6200_CONTROL_SITE_METHOD = git
 AETHER_X6200_CONTROL_LICENSE = GPLv2
