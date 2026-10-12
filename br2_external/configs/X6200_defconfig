@@ -197,6 +197,9 @@ BR2_PACKAGE_X6200_GUI=y
 # Headers only: the JS8 engine (js8core) needs boost/crc.hpp,
 # boost/multi_index and boost/math/ccmath. No Boost library is selected, so
 # only the headers go to the staging sysroot.
+# DRM/KMS: the kernel has the sun4i DRM and the panel driver; lv_drivers brings the
+# backend, which needs libdrm. The GUI uses it only when asked for (NEW_FEATURES 32).
+BR2_PACKAGE_LIBDRM=y
 BR2_PACKAGE_BOOST=y
 BR2_PACKAGE_OPENSSL=y
 BR2_PACKAGE_LIBOPENSSL_BIN=y
