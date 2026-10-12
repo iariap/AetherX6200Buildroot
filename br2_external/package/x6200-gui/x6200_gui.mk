@@ -12,6 +12,6 @@ X6200_GUI_LICENSE = GPLv2
 
 X6200_GUI_INSTALL_STAGING = YES
 
-X6200_GUI_DEPENDENCIES = libpng aether-x6200-control ft8lib speexdsp liquid-dsp
+X6200_GUI_DEPENDENCIES = libpng libdrm aether-x6200-control ft8lib speexdsp liquid-dsp
 
 $(eval $(cmake-package))
