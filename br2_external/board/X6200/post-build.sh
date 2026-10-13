@@ -48,4 +48,15 @@ if [ -d "$TARGET_DIR/usr/share/espeak-data" ]; then
     echo "espeak-data: $(du -sh "$TARGET_DIR/usr/share/espeak-data" | cut -f1)"
 fi
 
+# PulseAudio corre como el usuario `pulse`, pero los dispositivos /dev/snd/* son del grupo
+# `audio` (0600 root:audio). Sin esto, PulseAudio no puede abrir la placa, crea un sink NULO y
+# todo el audio de la GUI (la voz, el FT8) suena en el vacio sin ningun error. Medido en el
+# equipo: `id pulse` groups=1000(pulse) y `audio:x:29:` vacio.
+if [ -f "$TARGET_DIR/etc/group" ]; then
+    if ! grep -q '^audio:[^:]*:[0-9]*:.*pulse' "$TARGET_DIR/etc/group"; then
+        sed -i 's/^\(audio:[^:]*:[0-9]*:\)/\1pulse/' "$TARGET_DIR/etc/group"
+        echo "post-build: usuario pulse agregado al grupo audio ($(grep '^audio:' "$TARGET_DIR/etc/group"))"
+    fi
+fi
+
 exit 0
