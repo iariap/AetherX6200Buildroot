@@ -35,4 +35,17 @@ if ! grep -q '^pulse:' "${TARGET_DIR}/etc/passwd" 2>/dev/null; then
     echo "post-build: usuario pulse creado (uid ${PUID}) para el pulseaudio en modo sistema"
 fi
 
+# espeak: dejar sólo lo que se usa (español e inglés). Los datos completos son 2,8 MB y traen
+# decenas de idiomas.
+if [ -d "$TARGET_DIR/usr/share/espeak-data" ]; then
+    for f in "$TARGET_DIR"/usr/share/espeak-data/*; do
+        case "$(basename "$f")" in
+            es_dict|es_rules|en_dict|en_rules|intonations|phondata|phonindex|phontab|voices|variants)
+                ;;
+            *) rm -rf "$f" ;;
+        esac
+    done
+    echo "espeak-data: $(du -sh "$TARGET_DIR/usr/share/espeak-data" | cut -f1)"
+fi
+
 exit 0
