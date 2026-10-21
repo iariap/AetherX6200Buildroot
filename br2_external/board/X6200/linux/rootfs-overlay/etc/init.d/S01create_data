@@ -1,6 +1,17 @@
 #!/bin/sh
 
 start() {
+    # Si ya existe una particion DATA (ext4 o vfat, segun la tarjeta), montarla con su
+    # tipo real y salir. Evita que este script recree la tabla de particiones o formatee
+    # una DATA existente: antes, al no encontrar "fat32", podia terminar en mkfs -t vfat.
+    existingData=$(blkid -L DATA)
+    if [ -n "$existingData" ]; then
+        existingType=$(blkid -o value -s TYPE "$existingData" 2>/dev/null)
+        [ -n "$existingType" ] || existingType=$(blkid "$existingData" | sed 's/.*TYPE="\([^"]*\)".*/\1/')
+        echo "DATA ya existe ($existingData, $existingType): la monto y no toco la tabla"
+        grep -q " /mnt " /proc/mounts || mount -t "$existingType" "$existingData" /mnt 2>/dev/null
+        return
+    fi
     # Check fat32 not exists
     parted -m -s /dev/mmcblk0 print | grep fat32
     retVal=$?
