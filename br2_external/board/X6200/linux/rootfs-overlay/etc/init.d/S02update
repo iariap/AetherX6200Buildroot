@@ -1,24 +1,596 @@
 #!/bin/sh
+#
+# S02update - apply a verified in-place update from the DATA partition (/mnt).
+#
+# This is the SAME file in the two places it has to be installed:
+#
+#   * br2_external/board/X6200/linux/rootfs-overlay/etc/init.d/S02update
+#     (AetherX6200Buildroot): what a freshly written SD card runs;
+#   * tools/release/update-overlay/etc/init.d/S02update (x6200_gui): what a
+#     tgz installs, so the updates after it use this script.
+#
+# tools/release/check_updater_parity.sh fails when the two copies differ, and
+# it is part of the release gate.
+#
+# For every /mnt/x6200_r1cbu_*.tgz, in this order (nothing under / is modified
+# before step 4):
+#
+#   1. /mnt has to be a read-write mount;
+#   2. the <package>.sha256 sidecar has to sit next to the package, name it and
+#      match its SHA256; the gzip stream has to be complete (gzip -t) and the
+#      tar has to be traversable from end to end;
+#   3. preflight of the package's own entry list: relative names, no "." / ".."
+#      components, no empty name, no duplicates, only regular files, symlinks
+#      and hard links (no directory, device or fifo entry), the mount points
+#      /mnt /dev /proc /sys /run /tmp themselves (their children do travel: the
+#      audited rootfs ships symlinks under /dev), a listing that comes out clean
+#      (BusyBox tar warns on stderr when it has to strip a leading "/" or "../"
+#      from a member, which is exactly what this contract forbids) and exactly
+#      the audited setuid inventory (bin/busybox,
+#      usr/libexec/dbus-daemon-launch-helper, usr/libexec/ssh-keysign) with the
+#      audited modes and owners;
+#   4. ONE compressed backup, made with the target's own tar (never xargs,
+#      which splits the list and leaves an archive with only the first chunk
+#      readable), of the package's paths that already exist under /: written to
+#      /mnt/backup_<package>.partial and renamed to /mnt/backup_<package> only
+#      after its listing and the content of every backed-up file match what is
+#      on disk. The paths the package adds are listed in /mnt/new_<package>.list
+#      so they can be removed by hand;
+#   5. only then the package is unpacked over / (gzip -dc | tar -x, with
+#      pipefail so both sides of the pipe report their real status). If that
+#      fails, nothing is deleted and the operator is told to restore the
+#      backup;
+#   6. after unpacking, the installed tree is compared with the package (same
+#      verbose listing, same concatenated content hash), the updater must end
+#      up root:root 0755 and the GUI binary a plausible ELF; only then the
+#      package and its sidecar are deleted. The verified backup, the added-path
+#      list and the package are kept on any failure.
+#
+# Operator-facing status lines are the four in English below and nothing else;
+# every failure adds an indented "reason:" line in English underneath.
+#
+# There is no A/B, no signature and no automatic rollback: a sidecar only
+# detects accidental corruption (it does not prove authenticity), and a power
+# cut while a package is being unpacked over the single root filesystem is NOT
+# guaranteed to be recoverable. See docs/TESTING.md and
+# docs/evidencia/2026-10-22-hardening215/README.md.
+#
+# An image that still runs the stock S02update (the one this port shipped
+# before this change) runs ITS OWN script on the first in-place update, so none
+# of the checks below protect that first update. Do not use an in-place update
+# to migrate a historical image: reimage a lab card instead (see "First update
+# of a historical ROM" in docs/TESTING.md).
+#
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+
+# The target's /bin/sh is bash (X6200_defconfig) and is what makes the
+# decompress|tar pipelines report the failure of either side. Without pipefail
+# a truncated stream could look like a successful unpack, so refuse to run.
+if ! (set -o pipefail) 2>/dev/null; then
+    printf '%s\n' 'Update verification failed'
+    printf '  reason: %s\n' '/bin/sh does not support pipefail, so an unpack cannot be verified' >&2
+    exit 1
+fi
+set -o pipefail
+
+# rcS runs this before any login shell, so do not rely on /etc/profile.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+MNT=/mnt
+WORK=
+# The setuid inventory of the audited image: path, mode, owner:group.
+EXPECTED_SUID='bin/busybox -rwsr-xr-x 0/0
+usr/libexec/dbus-daemon-launch-helper -rwsr-x--- 0/101
+usr/libexec/ssh-keysign -rws--x--x 0/0'
+
+cleanup() {
+    if [ -n "$WORK" ]; then
+        rm -rf "$WORK"
+        WORK=
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+# The four operator-facing status lines, on stdout (the console init writes to).
+status() {
+    printf '%s\n' "$1"
+}
+# ... and their reasons, indented, on stderr.
+reason() {
+    printf '  reason: %s\n' "$1" >&2
+}
+
+# ---------------------------------------------------------------------------
+# /mnt
+# ---------------------------------------------------------------------------
+
+MNT_WHY=
+
+# /mnt has to be a mount point of its own and writable: an unmounted /mnt would
+# take the backup into the root filesystem, and a read-only one cannot hold it.
+# The filesystem is compared against / by what df reports (device, size, used,
+# mount point) instead of by the path in /proc/mounts: inside a chroot or a
+# container that path does not have to read like "/mnt". Equal values mean "it is
+# the root filesystem" (or that nothing could be read), which fails closed.
+mnt_id() {
+    df -P "$1" 2>/dev/null | awk 'NR == 2 { print $1 "|" $2 "|" $3 "|" $6 }'
+}
+
+mnt_is_rw() {
+    MNT_WHY=
+    root_id=$(mnt_id /)
+    mnt_id_value=$(mnt_id "$MNT")
+    if [ -z "$mnt_id_value" ] || [ "$mnt_id_value" = "$root_id" ]; then
+        MNT_WHY="$MNT is not a separate mount point (${mnt_id_value:-unreadable}), so a backup there would land on the root filesystem"
+        return 1
+    fi
+    probe=$MNT/.s02update-write-probe.$$
+    if ! touch "$probe"; then
+        MNT_WHY="$MNT is not writable (read-only mount or no space)"
+        return 1
+    fi
+    rm -f "$probe"
+    return 0
+}
+
+mnt_free_kb() {
+    df -k "$MNT" 2>/dev/null | awk 'NR > 1 { print $4 }' | tail -n 1
+}
+
+# ---------------------------------------------------------------------------
+# package listing and preflight
+# ---------------------------------------------------------------------------
+
+# Archive order, one name per line (the only listing that keeps a name with
+# spaces intact), and in $WORK/meta the same entries as
+# name<TAB>mode<TAB>size<TAB>owner<TAB>target. The two listings have to have
+# the same number of lines: they are paired by line number.
+read_package() {
+    pkg=$1
+    # El paquete es un gzip: el tar del target (BusyBox) no descomprime solo
+    # (-z no existe), así que se lo descomprime en el pipe. Con pipefail el exit
+    # del pipeline es el del que falle.
+    if ! err=$({ gzip -dc "$pkg" | tar -tf - ; } 2>&1 >"$WORK/names"); then
+        reason "cannot list the package: ${err:-the listing exited non-zero}"
+        return 1
+    fi
+    # BusyBox tar avisa por stderr cuando tiene que recortar un nombre (un "/"
+    # inicial o un "../" adelante) al listar: eso es una entrada que este contrato
+    # prohíbe y que el listado ya no muestra tal cual. Una lista limpia no dice
+    # nada, así que cualquier salida es motivo para no seguir.
+    if [ -n "$err" ]; then
+        reason "the package does not list cleanly: $err"
+        return 1
+    fi
+    if ! err=$({ gzip -dc "$pkg" | tar -tvf - ; } 2>&1 >"$WORK/verbose"); then
+        reason "cannot list the package in detail: ${err:-the listing exited non-zero}"
+        return 1
+    fi
+    if [ -n "$err" ]; then
+        reason "the package does not list cleanly: $err"
+        return 1
+    fi
+    n_names=$(wc -l < "$WORK/names")
+    n_verbose=$(wc -l < "$WORK/verbose")
+    if [ "$n_names" != "$n_verbose" ]; then
+        reason "the package lists $n_names names but $n_verbose detailed entries"
+        return 1
+    fi
+    if [ "$n_names" -eq 0 ]; then
+        reason "the package has no entries"
+        return 1
+    fi
+    awk '
+        FNR == NR { name[++n] = $0; next }
+        {
+            arrow = index($0, " -> ")
+            lto   = index($0, " link to ")
+            target = ""
+            if (arrow)     target = substr($0, arrow + 4)
+            else if (lto)  target = substr($0, lto + 9)
+            printf "%s\t%s\t%s\t%s\t%s\n", name[++m], $1, $3, $2, target
+        }
+    ' "$WORK/names" "$WORK/verbose" > "$WORK/meta"
+    cut -f1 "$WORK/meta" > "$WORK/meta_names"
+    [ -s "$WORK/meta_names" ] || { reason "the package has no entries"; return 1; }
+    return 0
+}
+
+# Names only: relative, no empty component, no ".", no "..", no control
+# character. Anything else would be taken out of the root filesystem.
+check_names() {
+    bad=$(awk '
+        {
+            name = $0
+            if (name == "")                     { print "empty entry name"; exit }
+            if (substr(name, 1, 1) == "/")      { print "absolute entry " name; exit }
+            if (name ~ /\/\//)                  { print "empty component in " name; exit }
+            if (name ~ /(^|\/)\.\.(\/|$)/)      { print "entry with a .. component: " name; exit }
+            if (name ~ /(^|\/)\.(\/|$)/)        { print "entry with a . component: " name; exit }
+            if (name ~ /[\t\r]/)                { print "entry with a control character"; exit }
+        }
+    ' "$WORK/names")
+    [ -z "$bad" ] || { reason "$bad"; return 1; }
+    dup=$(LC_ALL=C sort "$WORK/meta_names" | uniq -d | head -n 1)
+    [ -z "$dup" ] || { reason "duplicated entry $dup"; return 1; }
+    return 0
+}
+
+# Types and targets: regular files, symlinks and hard links only, and nothing
+# that lands under a filesystem the update must never write to.
+check_types() {
+    bad=$(awk -F'\t' '
+        {
+            name = $1; mode = $2; target = $5
+            t = substr(mode, 1, 1)
+            if (t == "d")                       { print "directory entry " name; exit }
+            if (t == "b" || t == "c")           { print "device entry " name; exit }
+            if (t == "p")                       { print "fifo entry " name; exit }
+            if (t == "s")                       { print "socket entry " name; exit }
+            if (t != "-" && t != "l" && t != "h") { print "unsupported entry type in " name; exit }
+            # "directamente": lo que no puede reemplazarse es la entrada del punto
+            # de montaje (mnt, dev, ...). Los hijos sí viajan: la rootfs auditada
+            # trae symlinks bajo /dev (dev/fd, dev/stdin, ...) que el paquete tiene
+            # que poder restaurar.
+            if (name == "mnt" || name == "dev" || name == "proc" ||
+                name == "sys" || name == "run" || name == "tmp") {
+                print "entry would replace the mount point /" name; exit
+            }
+            if (target != "") {
+                # Los target absolutos se admiten: la rootfs auditada los trae
+                # (etc/alsa/conf.d/*.conf -> /usr/share/alsa/...). Un enlace crea
+                # un enlace, y su target se resuelve dentro del mismo rootfs.
+                # Un ".." relativo se admite mientras el destino quede adentro (la
+                # imagen trae dev/fd -> ../proc/self/fd).
+                depth = 0
+                d = name
+                if (index(d, "/") == 0) d = ""
+                else sub(/\/[^\/]*$/, "", d)
+                if (d != "") depth = split(d, part, "/")
+                n = split(target, comp, "/")
+                for (i = 1; i <= n; i++) {
+                    if (comp[i] == "" || comp[i] == ".") continue
+                    if (comp[i] == "..") {
+                        if (--depth < 0) { print "link with a .. target that escapes the rootfs: " name; exit }
+                        continue
+                    }
+                    depth++
+                }
+            }
+        }
+    ' "$WORK/meta")
+    [ -z "$bad" ] || { reason "$bad"; return 1; }
+    return 0
+}
+
+# The setuid bits are exactly the audited ones, with the audited mode and
+# owner: the invalid "5 setuid bits" assertion of the packager is gone and a
+# package with anything else is refused before it can chown/chmod anything.
+check_setuid() {
+    printf '%s\n' "$EXPECTED_SUID" | LC_ALL=C sort > "$WORK/suid_expected"
+    awk -F'\t' 'substr($2, 4) ~ /[sS]/ { print $1 " " $2 " " $4 }' "$WORK/meta" |
+        LC_ALL=C sort > "$WORK/suid_actual"
+    if ! cmp -s "$WORK/suid_expected" "$WORK/suid_actual"; then
+        got=$(tr '\n' '; ' < "$WORK/suid_actual")
+        reason "the package does not carry the audited setuid inventory (got: ${got%%; })"
+        return 1
+    fi
+    return 0
+}
+
+# The updater itself has to travel root:root 0755 (the packager normalises the
+# checkout's uid 1000 away); a package that carries it otherwise is broken.
+check_updater_entry() {
+    line=$(awk -F'\t' '$1 == "etc/init.d/S02update" { print $2 " " $4; exit }' "$WORK/meta")
+    [ -n "$line" ] || return 0
+    [ "$line" = "-rwxr-xr-x 0/0" ] ||
+        { reason "etc/init.d/S02update travels as '$line', not -rwxr-xr-x 0/0"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# backup
+# ---------------------------------------------------------------------------
+
+# The package's paths that already exist under / (a dangling symlink exists
+# too: it is still something worth being able to restore). Everything else is a
+# path the package adds.
+split_paths() {
+    : > "$WORK/exists_names"
+    while IFS= read -r name; do
+        [ -e "./$name" ] || [ -L "./$name" ] || continue
+        printf '%s\n' "$name" >> "$WORK/exists_names"
+    done < "$WORK/meta_names"
+    awk -F'\t' 'FNR == NR { ok[$0] = 1; next } ($1 in ok) { print }' \
+        "$WORK/exists_names" "$WORK/meta" > "$WORK/exist_meta"
+    cut -f1 "$WORK/exist_meta" > "$WORK/exist_names"
+    awk -F'\t' 'FNR == NR { ok[$0] = 1; next } !($1 in ok) { print $1 }' \
+        "$WORK/exists_names" "$WORK/meta" > "$WORK/new_names"
+    return 0
+}
+
+# The backup is one compressed tar made by the target's own tar from a list
+# file (no xargs), written as .partial and validated before it gets its final
+# name: same names, and the content of every file matches what is on /.
+build_backup() {
+    pkg=$1
+    base=$(basename "$pkg")
+    part=$MNT/backup_$base.partial
+    final=$MNT/backup_$base
+
+    need=0
+    if [ -s "$WORK/exist_meta" ]; then
+        need=$(awk -F'\t' '{ s += $3 } END { print s + 0 }' "$WORK/exist_meta")
+        lines=$(wc -l < "$WORK/exist_meta")
+        need=$((need + lines * 1024 + 1048576))
+    fi
+    free_kb=$(mnt_free_kb)
+    case "$free_kb" in
+        ''|*[!0-9]*) reason "cannot read the free space of $MNT"; return 1 ;;
+    esac
+    if [ "$free_kb" -lt $(( (need + 1023) / 1024 )) ]; then
+        reason "$MNT has ${free_kb} KiB free and the backup needs about $(( (need + 1023) / 1024 )) KiB"
+        return 1
+    fi
+
+    rm -f "$part"
+    if ! err=$({ tar -cf - -C / --no-recursion -T "$WORK/exist_names" | gzip -c > "$part"; } 2>&1); then
+        rm -f "$part"
+        reason "cannot build the backup: ${err:-tar exited non-zero}"
+        return 1
+    fi
+
+    if ! err=$({ gzip -dc "$part" | tar -tf - ; } 2>&1 >"$WORK/backup_meta"); then
+        rm -f "$part"
+        reason "the backup cannot be listed back: ${err:-the listing exited non-zero}"
+        return 1
+    fi
+    cut -f1 "$WORK/backup_meta" 2>/dev/null > "$WORK/backup_names"
+    LC_ALL=C sort "$WORK/exist_names" > "$WORK/exist_sorted"
+    LC_ALL=C sort "$WORK/backup_names" > "$WORK/backup_sorted"
+    if ! cmp -s "$WORK/exist_sorted" "$WORK/backup_sorted"; then
+        rm -f "$part"
+        reason "the backup does not list the same paths it was given"
+        return 1
+    fi
+
+    if ! ondisk=$(tar -cf - -C / --no-recursion -T "$WORK/exist_names" | tar -xOf - | sha256sum | awk '{ print $1 }'); then
+        rm -f "$part"
+        reason "cannot hash the files being backed up"
+        return 1
+    fi
+    if ! inbox=$(gzip -dc "$part" | tar -xOf - | sha256sum | awk '{ print $1 }'); then
+        rm -f "$part"
+        reason "cannot hash the backup contents"
+        return 1
+    fi
+    if [ -z "$ondisk" ] || [ "$ondisk" != "$inbox" ]; then
+        rm -f "$part"
+        reason "the backup content does not match the files on /"
+        return 1
+    fi
+
+    if [ -e "$final" ]; then
+        if [ "$(sha256sum "$final" | awk '{ print $1 }')" = "$(sha256sum "$part" | awk '{ print $1 }')" ]; then
+            rm -f "$part"
+        else
+            rm -f "$part"
+            reason "an existing $final holds different content: refusing to overwrite it"
+            return 1
+        fi
+    else
+        if ! mv -f "$part" "$final"; then
+            rm -f "$part"
+            reason "cannot rename $part to $final"
+            return 1
+        fi
+    fi
+    sync
+    return 0
+}
+
+# The added paths, so an operator can remove them by hand to go back.
+write_new_list() {
+    base=$(basename "$1")
+    list=$MNT/new_$base.list
+    : > "$WORK/new_$base.list"
+    cp "$WORK/new_names" "$WORK/new_$base.list" || return 1
+    mv -f "$WORK/new_$base.list" "$list" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# apply and verify
+# ---------------------------------------------------------------------------
+
+# The installed tree has to be the package: same listing (names, order, modes,
+# owners, sizes, mtimes) and the same concatenated content hash. The listing
+# comparison is what catches a file installed with the wrong owner; the hash is
+# what catches wrong or missing content.
+# El listado del paquete y el del arbol instalado se comparan sin la fecha/hora:
+# el tar del target no restaura el mtime de los symlinks al extraer (los crea con
+# la hora de la extraccion), asi que las fechas no pueden formar parte de la
+# comparacion. Modo, dueno, tamano, tipo, nombre y target si; el contenido de los
+# archivos regulares se comprueba aparte, con el hash.
+strip_dates() {
+    awk 'NF >= 6 { out = $1 " " $2 " " $3; for (i = 6; i <= NF; i++) out = out " " $i; print out; next }
+         { print }' "$1" > "$1.nodate"
+}
+
+verify_installed() {
+    pkg=$1
+    if ! err=$({ gzip -dc "$pkg" | tar -tvf - ; } 2>&1 >"$WORK/pkg_verbose"); then
+        reason "cannot list the package after unpacking: $err"
+        return 1
+    fi
+    if ! err=$({ tar -cf - -C / --no-recursion -T "$WORK/meta_names" | tar -tvf - ; } 2>&1 >"$WORK/ins_verbose"); then
+        reason "cannot list the installed tree: $err"
+        return 1
+    fi
+    strip_dates "$WORK/pkg_verbose"
+    strip_dates "$WORK/ins_verbose"
+    if ! cmp -s "$WORK/pkg_verbose.nodate" "$WORK/ins_verbose.nodate"; then
+        diff_line=$(diff "$WORK/pkg_verbose.nodate" "$WORK/ins_verbose.nodate" 2>/dev/null | tail -n +3 | head -n 2 | tr '\n' ' ')
+        [ -n "$diff_line" ] || diff_line=$(cmp "$WORK/pkg_verbose.nodate" "$WORK/ins_verbose.nodate" 2>&1 | head -n 1)
+        reason "the installed tree does not match the package: ${diff_line:-listings differ}"
+        return 1
+    fi
+    if ! pkg_hash=$(gzip -dc "$pkg" | tar -xOf - | sha256sum | awk '{ print $1 }'); then
+        reason "cannot hash the package content"
+        return 1
+    fi
+    if ! ins_hash=$(tar -cf - -C / --no-recursion -T "$WORK/meta_names" | tar -xOf - | sha256sum | awk '{ print $1 }'); then
+        reason "cannot hash the installed content"
+        return 1
+    fi
+    if [ -z "$pkg_hash" ] || [ "$pkg_hash" != "$ins_hash" ]; then
+        reason "the installed content is not the package content"
+        return 1
+    fi
+
+    upd=$(printf '%s\n' "$(cat "$WORK/ins_verbose")" | awk '$NF == "etc/init.d/S02update" { print $1 " " $2; exit }')
+    [ "$upd" = "-rwxr-xr-x 0/0" ] ||
+        { reason "the updater did not end up root:root 0755 (${upd:-missing})"; return 1; }
+
+    gui_mode=$(printf '%s\n' "$(cat "$WORK/ins_verbose")" | awk '$NF == "usr/sbin/x6200_gui" { print $1; exit }')
+    gui_size=$(printf '%s\n' "$(cat "$WORK/ins_verbose")" | awk '$NF == "usr/sbin/x6200_gui" { print $3; exit }')
+    [ "$gui_mode" = "-rwxr-xr-x" ] && [ -n "$gui_size" ] && [ "$gui_size" -ge 1048576 ] ||
+        { reason "the GUI binary is not a 0755 file of at least 1 MiB (${gui_mode:-missing} ${gui_size:-missing})"; return 1; }
+    magic=$(head -c 4 /usr/sbin/x6200_gui | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = "7f454c46" ] ||
+        { reason "the GUI binary does not start with the ELF magic (got $magic)"; return 1; }
+    return 0
+}
+
+apply_one() {
+    pkg=$1
+    base=$(basename "$pkg")
+    side=$pkg.sha256
+
+    if ! mnt_is_rw; then
+        status 'Update backup failed'
+        reason "$MNT_WHY"
+        return 1
+    fi
+
+    if [ ! -f "$side" ]; then
+        status 'Update verification failed'
+        reason "the package has no $base.sha256 sidecar next to it"
+        return 1
+    fi
+    side_lines=$(wc -l < "$side")
+    side_hash=$(awk 'NR == 1 { print $1 }' "$side")
+    side_name=$(awk 'NR == 1 { print $2 }' "$side")
+    if [ "$side_lines" -ne 1 ] || [ -z "$side_hash" ] || [ -z "$side_name" ]; then
+        status 'Update verification failed'
+        reason "the sidecar is not '<sha256>  <package>' with a single line"
+        return 1
+    fi
+    if [ "$side_name" != "$base" ]; then
+        status 'Update verification failed'
+        reason "the sidecar names '$side_name' instead of '$base'"
+        return 1
+    fi
+    if ! actual=$(sha256sum "$pkg" | awk '{ print $1 }'); then
+        status 'Update verification failed'
+        reason "cannot read $pkg"
+        return 1
+    fi
+    if [ "$actual" != "$side_hash" ]; then
+        status 'Update verification failed'
+        reason "the package SHA256 ($actual) is not the one the sidecar says ($side_hash)"
+        return 1
+    fi
+
+    if ! err=$(gzip -t "$pkg" 2>&1); then
+        status 'Update verification failed'
+        reason "the package is not a complete gzip stream: $err"
+        return 1
+    fi
+
+    if ! read_package "$pkg"; then
+        status 'Update verification failed'
+        return 1
+    fi
+    if ! check_names; then
+        status 'Update verification failed'
+        return 1
+    fi
+    if ! check_types; then
+        status 'Update verification failed'
+        return 1
+    fi
+    if ! check_setuid; then
+        status 'Update verification failed'
+        return 1
+    fi
+    if ! check_updater_entry; then
+        status 'Update verification failed'
+        return 1
+    fi
+
+    split_paths
+    if ! build_backup "$pkg"; then
+        status 'Update backup failed'
+        return 1
+    fi
+    if ! write_new_list "$pkg"; then
+        status 'Update backup failed'
+        reason "cannot write $MNT/new_$base.list"
+        return 1
+    fi
+
+    if ! err=$({ gzip -dc "$pkg" | tar -xf - -C / ; } 2>&1); then
+        status 'Update failed: package retained; restore backup manually'
+        reason "${err:-the unpack exited non-zero}"
+        return 1
+    fi
+
+    if ! verify_installed "$pkg"; then
+        status 'Update verification failed'
+        reason "the package and its sidecar were kept; restore $MNT/backup_$base by hand"
+        return 1
+    fi
+
+    if ! rm -f "$pkg" "$side"; then
+        status 'Update verification failed'
+        reason "the update applied but $pkg and its sidecar could not be removed"
+        return 1
+    fi
+    sync
+    status 'Update applied'
+    return 0
+}
 
 start() {
-    cd /
-
-    for i in /mnt/x6200_r1cbu_*.tgz; do
-        [ ! -f "$i" ] && continue
-        echo "Creating backup from $i"
-        zcat $i | tar -tf - | xargs tar -cvf - | gzip > /mnt/backup_$(basename $i)
-        echo "Update from $i"
-        zcat $i | tar -xf -
-        rm $i
+    cd / || return 1
+    WORK=$(mktemp -d /tmp/s02update.XXXXXX) || {
+        status 'Update verification failed'
+        reason "cannot create a working directory in /tmp"
+        return 1
+    }
+    rc=0
+    for i in $MNT/x6200_r1cbu_*.tgz; do
+        [ -f "$i" ] || continue
+        apply_one "$i" || { rc=1; break; }
     done
+    return $rc
 }
 
 case "$1" in
     start)
-        start;;
+        start
+        rc=$?
+        ;;
     stop)
+        rc=0
         ;;
     *)
-        echo "Usage: $0 {start}"
-    exit 1
+        echo "Usage: $0 {start}" >&2
+        rc=1
+        ;;
 esac
+exit $rc

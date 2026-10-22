@@ -97,3 +97,24 @@ despues, y se inspeccionan **stdout, stderr y exit code** por separado.
   verificacion del rootfs generado.
 * La tabla se edita en algunos casos con `parted` sobre el archivo (no via el
   script), lo que es equivalente pero no idéntico a un disco recien escrito.
+
+## `S02update` (issue #215)
+
+El **mismo archivo** vive en los dos puntos de instalacion: este repo
+(`br2_external/board/X6200/linux/rootfs-overlay/etc/init.d/S02update`, lo que
+corre una imagen recien grabada) y `x6200_gui`
+(`tools/release/update-overlay/etc/init.d/S02update`, lo que instala una
+actualizacion). `x6200_gui` tiene el gate de paridad
+(`tools/release/check_updater_parity.sh`, mismo hash o falla) y **el banco del
+contrato de actualizacion**: `tests/release/test_safe_update.sh` (contenedor
+privado con qemu-user, chroot sobre una copia de una rootfs real, matriz de
+paquetes buenos y malos, backup, sidecar, setuid y el primer update de una
+imagen historica como `UNSUPPORTED/UNSAFE_LEGACY`).
+
+No hace falta duplicarlo aca: el script que se prueba es byte a byte el mismo
+que este repo instala en la imagen, y el gate de paridad es el que garantiza que
+sigan iguales.
+
+`rootfs-overlay/etc/fstab` y `S01create_data` **no** son parte de este cambio
+(son responsabilidad del issue de DATA, #212).
+
