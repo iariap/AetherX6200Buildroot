@@ -46,6 +46,16 @@
 #      package and its sidecar are deleted. The verified backup, the added-path
 #      list and the package are kept on any failure.
 #
+# This file is the one an update replaces: while it runs, the package installs
+# its own S02update over it. A shell reads its script by file offset, so it can
+# end up parsing the tail of the freshly installed script and re-running the
+# dispatch below -- the update re-entering itself (issue iariap/x6200_gui#231).
+# The pass therefore marks itself in the environment (S02UPDATE_PASS, the status
+# of the pass that already ran in that process tree); a re-entry finds the mark
+# and does nothing but exit with that status, so the pass cannot repeat without
+# bound. A fresh invocation (rcS, an operator retrying a failed update) has no
+# mark and runs a normal pass.
+#
 # Operator-facing status lines are the four in English below and nothing else;
 # every failure adds an indented "reason:" line in English underneath.
 #
@@ -80,6 +90,16 @@ export PATH
 
 MNT=/mnt
 WORK=
+# El estado del pase de actualización que YA corrió en este árbol de procesos
+# (vacío = ninguno). Ver start(): este archivo es el que la actualización
+# reemplaza, así que el shell que lo está leyendo puede volver a parsear la cola
+# del script instalado y re-correr el despacho (issue iariap/x6200_gui#231), y
+# cada pase vuelve a extraer el paquete y a leer este archivo. Sin marca esa
+# re-entrada no tiene tope: es el fork bomb. La marca viaja en el entorno, así
+# que la ven la re-lectura, los subshells y los hijos de este pase, pero no un
+# arranque nuevo (rcS, o un operador que reintenta un update fallido).
+S02UPDATE_PASS=${S02UPDATE_PASS:-}
+export S02UPDATE_PASS
 # The setuid inventory of the audited image: path, mode, owner:group.
 EXPECTED_SUID='bin/busybox -rwsr-xr-x 0/0
 usr/libexec/dbus-daemon-launch-helper -rwsr-x--- 0/101
@@ -566,6 +586,13 @@ apply_one() {
 }
 
 start() {
+    # Re-entrada: ya hubo un pase en este árbol de procesos (ver la marca
+    # S02UPDATE_PASS arriba), así que esto no es una actualización nueva. No se
+    # toca nada y se sale con el estado de ese pase: el que cuenta es el
+    # primero. Un arranque nuevo no hereda la marca y corre normal.
+    if [ -n "$S02UPDATE_PASS" ]; then
+        return "$S02UPDATE_PASS"
+    fi
     cd / || return 1
     WORK=$(mktemp -d /tmp/s02update.XXXXXX) || {
         status 'Update verification failed'
@@ -577,6 +604,8 @@ start() {
         [ -f "$i" ] || continue
         apply_one "$i" || { rc=1; break; }
     done
+    S02UPDATE_PASS=$rc
+    export S02UPDATE_PASS
     return $rc
 }
 
