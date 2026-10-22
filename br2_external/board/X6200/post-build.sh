@@ -12,13 +12,21 @@ set -e
 
 TARGET_DIR="$1"
 
+# PulseAudio: el paquete de Buildroot instala su propio /etc/init.d/S50pulseaudio, que corre
+# DESPUES de S20gui (la GUI inicializa su cliente una sola vez, ver src/audio.c) y ademas deja
+# DOS arranques en la imagen si el overlay trae S12pulseaudio. Se quita el del paquete: el
+# overlay aporta S12pulseaudio, que arranca antes de la GUI. Sin esto la imagen lleva los dos
+# scripts (medido: rootfs con S12pulseaudio y S50pulseaudio) y pulseaudio intenta arrancar dos
+# veces en el boot.
+rm -f "${TARGET_DIR}/etc/init.d/S50pulseaudio"
+
 # C/C++ headers: build-time only
 rm -rf "${TARGET_DIR}/usr/include"
 
 # pkg-config files and static libraries are build-time only too
 find "${TARGET_DIR}/usr/lib" -maxdepth 2 -name "*.la" -delete 2>/dev/null || true
 
-# pulseaudio arranca en modo sistema (S50pulseaudio lo llama con --system) y en modo
+# pulseaudio arranca en modo sistema (S12pulseaudio lo llama con --system) y en modo
 # sistema necesita el usuario `pulse`: sin él el log dice "Failed to find user 'pulse'",
 # el daemon no arranca y la GUI se quedaba esperando un contexto que nunca llegaba a
 # READY (ver src/audio.c). Se crea acá, con un uid libre.
