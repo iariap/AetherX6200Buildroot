@@ -23,6 +23,7 @@
 
 import os
 import sqlite3
+import ssl
 import sys
 import time
 import urllib.parse
@@ -33,6 +34,7 @@ STATE = os.environ.get("QRZ_STATE", "/mnt/qrz_upload.state")
 LOG = os.environ.get("QRZ_LOG", "/mnt/qrz-upload.log")
 DB = os.environ.get("QRZ_DB", "/mnt/qso_log.db")
 API = "https://logbook.qrz.com/api"
+CA = os.environ.get("QRZ_CA", "/etc/ssl/certs/ca-certificates.crt")
 UA = "X6200-QRZ-Upload/1.0 (LU2DSX)"
 WLAN = os.environ.get("QRZ_WLAN", "/sys/class/net/wlan0/operstate")
 
@@ -69,7 +71,6 @@ def read_conf():
             log("creada plantilla %s (falta api_key)" % CONF)
         except OSError as e:
             log("no puedo crear %s: %s" % (CONF, e))
-        return conf
     try:
         with open(CONF) as f:
             for line in f:
@@ -169,7 +170,8 @@ def upload(api_key, adif):
     req = urllib.request.Request(API, data=body, method="POST",
                                  headers={"User-Agent": UA,
                                           "Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    ctx = ssl.create_default_context(cafile=CA if os.path.exists(CA) else None)
+    with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
         return resp.read().decode("utf-8", "replace")
 
 
