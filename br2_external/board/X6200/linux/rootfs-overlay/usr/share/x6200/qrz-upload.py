@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 #
-# X6200 — sube los QSO nuevos al QRZ Logbook cuando hay WiFi.
+# X6200 — sube los QSO nuevos a los logs online cuando hay WiFi.
+#
+# Proveedores: QRZ Logbook, eQSL y Clublog (cada uno se habilita en /mnt/upload.conf).
 #
 # Uso:
 #   qrz-upload.py --once     corre una pasada (para probar)
@@ -8,17 +10,18 @@
 #   qrz-upload.py --status   muestra configuracion y estado sin subir nada
 #   qrz-upload.py --adif     imprime el ADIF de todos los QSO del log (subida manual)
 #
-# Configuracion: /mnt/qrz.conf  (se crea con la plantilla la primera vez)
-#   enabled=1
-#   api_key=XXXX-XXXX-XXXX-XXXX      # QRZ Logbook API access key
-#   interval=30                      # segundos entre pasadas
-#
-# Estado: /mnt/qrz_upload.state  (ultimo rowid subido con exito)
+# Config: /mnt/upload.conf (se crea con la plantilla la primera vez)
+# Estado: /mnt/<proveedor>_upload.state  (ultimo rowid subido con exito)
 # Log:    /mnt/qrz-upload.log
 #
-# API: https://logbook.qrz.com/api  (POST KEY=...&ACTION=INSERT&ADIF=...)
-#      respuesta: RESULT=OK|REPLACE|FAIL&REASON=...
-#      Requiere suscripcion QRZ para INSERT (segun la guia de QRZ).
+# APIs (fundadas en la documentacion de cada servicio):
+#  - QRZ:     POST https://logbook.qrz.com/api  KEY+ACTION=INSERT+ADIF (suscripcion
+#             requerida por QRZ para INSERT; sin ella responde RESULT=AUTH)
+#  - eQSL:    POST multipart https://www.eQSL.cc/qslcard/ImportADIF.cfm
+#             campos Filename (ADIF), EQSL_USER, EQSL_PSWD
+#             exito: "Result: x out of y records added" (o "Bad record: Duplicate")
+#  - Clublog: POST multipart https://clublog.org/putlogs.php
+#             campos file (ADIF), email, callsign, password (app password), api (API key)
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
@@ -27,25 +30,43 @@ import sqlite3
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
-CONF = os.environ.get("QRZ_CONF", "/mnt/qrz.conf")
-STATE = os.environ.get("QRZ_STATE", "/mnt/qrz_upload.state")
-COOLDOWN = os.environ.get("QRZ_COOLDOWN", "/mnt/qrz_upload.cooldown")
+CONF = os.environ.get("QRZ_CONF", "/mnt/upload.conf")
+LEGACY_CONF = "/mnt/qrz.conf"
 LOG = os.environ.get("QRZ_LOG", "/mnt/qrz-upload.log")
 DB = os.environ.get("QRZ_DB", "/mnt/qso_log.db")
-API = "https://logbook.qrz.com/api"
 CA = os.environ.get("QRZ_CA", "/etc/ssl/certs/ca-certificates.crt")
-UA = "X6200-QRZ-Upload/1.0 (LU2DSX)"
 WLAN = os.environ.get("QRZ_WLAN", "/sys/class/net/wlan0/operstate")
 
-CONF_TEMPLATE = """# X6200 QRZ Logbook uploader
-# Poné tu API access key del QRZ Logbook (https://www.qrz.com/logbook -> API key)
-# INSERT por API requiere suscripcion QRZ.
+UA = "X6200-LogUpload/1.0 (LU2DSX)"
+QRZ_API = "https://logbook.qrz.com/api"
+EQSL_API = "https://www.eQSL.cc/qslcard/ImportADIF.cfm"
+CL_API = "https://clublog.org/putlogs.php"
+
+CONF_TEMPLATE = """# X6200 — subida automatica de QSO a logs online
+# Habilita los proveedores que uses; sin credenciales no sube nada de ese proveedor.
 enabled=1
-api_key=
 interval=30
+
+# QRZ Logbook (INSERT por API requiere suscripcion QRZ)
+qrz_enabled=0
+qrz_api_key=
+
+# eQSL (gratis; usuario y clave de eqsl.cc)
+eqsl_enabled=1
+eqsl_user=
+eqsl_pswd=
+
+# Clublog (gratis; la API key y el "App password" se generan en clublog.org)
+clublog_enabled=1
+clublog_callsign=LU2DSX
+clublog_email=
+clublog_password=
+clublog_api=
 """
 
 
@@ -64,15 +85,35 @@ def log(msg):
 
 
 def read_conf():
-    conf = {"enabled": "0", "api_key": "", "interval": "30"}
+    """Devuelve dict con la config; migra /mnt/qrz.conf (v0.1.6) si existe."""
     if not os.path.exists(CONF):
+        qrz_key = ""
+        qrz_en = "0"
+        if os.path.exists(LEGACY_CONF):
+            try:
+                with open(LEGACY_CONF) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("api_key=") and line[8:]:
+                            qrz_key = line[8:]
+                        if line.startswith("enabled=") and line[8:]:
+                            qrz_en = "1" if line[8:].strip() in ("1", "true", "yes") else "0"
+            except OSError:
+                pass
+            try:
+                os.replace(LEGACY_CONF, LEGACY_CONF + ".migrado")
+            except OSError:
+                pass
+        txt = CONF_TEMPLATE.replace("qrz_enabled=0", "qrz_enabled=" + qrz_en)
+        txt = txt.replace("qrz_api_key=\n", "qrz_api_key=%s\n" % qrz_key)
         try:
             with open(CONF, "w") as f:
-                f.write(CONF_TEMPLATE)
+                f.write(txt)
             os.chmod(CONF, 0o600)
-            log("creada plantilla %s (falta api_key)" % CONF)
+            log("creada plantilla %s" % CONF)
         except OSError as e:
             log("no puedo crear %s: %s" % (CONF, e))
+    conf = {"enabled": "1", "interval": "30"}
     try:
         with open(CONF) as f:
             for line in f:
@@ -86,6 +127,14 @@ def read_conf():
     return conf
 
 
+def cfg(conf, key, default=""):
+    return conf.get(key, default).strip()
+
+
+def truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "si", "sí", "on")
+
+
 def network_up():
     try:
         with open(WLAN) as f:
@@ -94,39 +143,46 @@ def network_up():
         return False
 
 
-def read_last_rowid():
+def state_path(prov):
+    return os.environ.get("QRZ_STATE_" + prov.upper(), "/mnt/%s_upload.state" % prov)
+
+
+def cooldown_path(prov):
+    return "/mnt/%s_upload.cooldown" % prov
+
+
+def read_last_rowid(prov):
     try:
-        with open(STATE) as f:
+        with open(state_path(prov)) as f:
             return int(f.read().strip() or "0")
     except (OSError, ValueError):
         return 0
 
 
-def write_last_rowid(rowid):
-    tmp = STATE + ".tmp"
+def write_last_rowid(prov, rowid):
+    tmp = state_path(prov) + ".tmp"
     try:
         with open(tmp, "w") as f:
             f.write(str(rowid))
-        os.replace(tmp, STATE)
+        os.replace(tmp, state_path(prov))
     except OSError as e:
-        log("no puedo escribir %s: %s" % (STATE, e))
+        log("no puedo escribir %s: %s" % (state_path(prov), e))
 
 
-def read_cooldown():
-    """Segundos que faltan para reintentar (0 si toca ahora)."""
+def read_cooldown(prov):
     try:
-        with open(COOLDOWN) as f:
+        with open(cooldown_path(prov)) as f:
             return max(0, int(f.read().strip() or "0") - int(time.time()))
     except (OSError, ValueError):
         return 0
 
 
-def write_cooldown(seconds):
+def write_cooldown(prov, seconds):
     try:
-        with open(COOLDOWN, "w") as f:
+        with open(cooldown_path(prov), "w") as f:
             f.write(str(int(time.time()) + seconds))
     except OSError as e:
-        log("no puedo escribir %s: %s" % (COOLDOWN, e))
+        log("no puedo escribir %s: %s" % (cooldown_path(prov), e))
 
 
 MODE_TO_ADIF = {1: "SSB", 2: "AM", 3: "FM", 4: "CW", 5: "FT8", 6: "JS8", 7: "FT4", 8: "RTTY"}
@@ -167,6 +223,14 @@ def adif_for_row(row):
     return s
 
 
+def adif_batch(rows):
+    recs = [adif_for_row(r) for r in rows]
+    recs = [r for r in recs if r]
+    if not recs:
+        return ""
+    return "<adif_ver:5>3.1.0 <programid:8>X6200GUI <EOH>\n" + "\n".join(recs) + "\n"
+
+
 def pending_rows(last_rowid):
     if not os.path.exists(DB):
         return []
@@ -184,82 +248,174 @@ def pending_rows(last_rowid):
         return []
 
 
-def upload(api_key, adif):
-    body = urllib.parse.urlencode({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif}).encode()
-    req = urllib.request.Request(API, data=body, method="POST",
-                                 headers={"User-Agent": UA,
-                                          "Content-Type": "application/x-www-form-urlencoded"})
+def multipart(fields, filename, filecontent):
+    boundary = "----X6200" + uuid.uuid4().hex
+    body = b""
+    for k, v in fields.items():
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                 % (boundary, k, v)).encode()
+    body += ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+             "Content-Type: text/plain\r\n\r\n" % (boundary, filename)).encode()
+    body += filecontent.encode() + b"\r\n"
+    body += ("--%s--\r\n" % boundary).encode()
+    return body, "multipart/form-data; boundary=" + boundary
+
+
+def http_post(url, body, content_type, headers=None):
+    h = {"User-Agent": UA, "Content-Type": content_type}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=body, method="POST", headers=h)
     ctx = ssl.create_default_context(cafile=CA if os.path.exists(CA) else None)
-    with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
         return resp.read().decode("utf-8", "replace")
 
 
-def run_once(conf):
-    api_key = conf.get("api_key", "").strip()
+# --- proveedores -----------------------------------------------------------
+
+def upload_qrz(conf, rows, adif):
+    api_key = cfg(conf, "qrz_api_key")
     if not api_key:
-        log("sin api_key en %s; no subo nada" % CONF)
-        return 0
-    wait = read_cooldown()
+        return None, "sin qrz_api_key"
+    body = urllib.parse.urlencode({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif}).encode()
+    answer = http_post(QRZ_API, body, "application/x-www-form-urlencoded")
+    if "RESULT=OK" in answer or "RESULT=REPLACE" in answer:
+        return True, answer.strip()[:160]
+    if "RESULT=AUTH" in answer:
+        return "auth", answer.strip()[:200]
+    return False, answer.strip()[:200]
+
+
+def upload_eqsl(conf, rows, adif):
+    user = cfg(conf, "eqsl_user")
+    pswd = cfg(conf, "eqsl_pswd")
+    if not user or not pswd:
+        return None, "sin eqsl_user/eqsl_pswd"
+    # Metodo documentado en ImportADIF.txt: form con ADIFData + EQSL_USER + EQSL_PSWD.
+    body = urllib.parse.urlencode({"EQSL_USER": user, "EQSL_PSWD": pswd,
+                                   "ADIFData": adif}).encode()
+    answer = http_post(EQSL_API, body, "application/x-www-form-urlencoded")
+    flat = " ".join(answer.replace("\r", " ").split())
+    if "records added" in flat or "Bad record: Duplicate" in flat:
+        return True, flat[:200]
+    low = flat.lower()
+    if "no match on eqsl_user" in low or "missing eqsl_user" in low or "missing eqsl_pswd" in low:
+        return "auth", flat[:200]
+    if "error:" in low:
+        return False, flat[:200]
+    return False, flat[:200]
+
+
+def upload_clublog(conf, rows, adif):
+    # Medido 27/10 desde la red del proyecto: https://clublog.org/putlogs.php responde
+    # 403 Forbidden de nginx incluso para un GET (otras paginas del sitio dan 200),
+    # asi que puede ser un bloqueo por red/region. Se implementa igual segun la guia
+    # (multipart: file/email/callsign/password/api) y el 403 se trata como auth para
+    # no insistir: el daemon reintenta en 1 h.
+    email = cfg(conf, "clublog_email")
+    callsign = cfg(conf, "clublog_callsign")
+    pswd = cfg(conf, "clublog_password")
+    api = cfg(conf, "clublog_api")
+    if not (email and callsign and pswd and api):
+        return None, "faltan clublog_email/callsign/password/api"
+    body, ctype = multipart({"email": email, "callsign": callsign,
+                             "password": pswd, "api": api}, "qso.adi", adif)
+    try:
+        answer = http_post(CL_API, body, ctype)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return "auth", "HTTP %d (Clublog bloquea esta red o credenciales)" % e.code
+        raise
+    low = answer.lower()
+    if "invalid api key" in low or "login" in low or "password" in low or "not found" in low:
+        return "auth", answer.replace("\r", " ")[:200]
+    if "error" in low:
+        return False, answer.replace("\r", " ")[:200]
+    return True, answer.replace("\r", " ")[:160]
+
+
+PROVIDERS = [
+    ("qrz", "qrz_enabled", upload_qrz),
+    ("eqsl", "eqsl_enabled", upload_eqsl),
+    ("clublog", "clublog_enabled", upload_clublog),
+]
+
+
+def run_provider(conf, prov, enabled_key, fn):
+    if not truthy(cfg(conf, enabled_key, "0")):
+        return None
+    wait = read_cooldown(prov)
     if wait > 0:
-        return 0
-    if not network_up():
-        return 0
-    last = read_last_rowid()
+        return None
+    last = read_last_rowid(prov)
     rows = pending_rows(last)
     if not rows:
         return 0
+    adif = adif_batch(rows)
+    if not adif:
+        return 0
+    try:
+        ok, msg = fn(conf, rows, adif)
+    except urllib.error.HTTPError as e:
+        log("%s: HTTP %d de red: %s; reintento en 1 h" % (prov, e.code, e.reason))
+        if e.code in (401, 403):
+            write_cooldown(prov, 3600)
+        return 0
+    except Exception as e:
+        log("%s: error de red: %s" % (prov, e))
+        return 0
+    if ok is None:
+        return None  # sin credenciales: silencio
+    if ok == "auth":
+        log("%s sin permiso/credenciales: %s; reintento en 1 h" % (prov, msg))
+        write_cooldown(prov, 3600)
+        return 0
+    if ok:
+        write_last_rowid(prov, rows[-1][0])
+        log("%s: subidos %d QSO (rowid<=%d): %s" % (prov, len(rows), rows[-1][0], msg))
+        return len(rows)
+    log("%s rechazo (rowid=%d): %s" % (prov, rows[0][0], msg))
+    return 0
+
+
+def run_once(conf):
     sent = 0
-    for row in rows:
-        adif = adif_for_row(row)
-        if adif is None:
-            log("QSO rowid=%d no convertible a ADIF; lo salto" % row[0])
-            write_last_rowid(row[0])
-            continue
+    for prov, key, fn in PROVIDERS:
         try:
-            answer = upload(api_key, adif)
+            n = run_provider(conf, prov, key, fn)
+            if n:
+                sent += n
         except Exception as e:
-            log("error de red subiendo rowid=%d: %s" % (row[0], e))
-            return sent
-        if "RESULT=OK" in answer or "RESULT=REPLACE" in answer:
-            write_last_rowid(row[0])
-            sent += 1
-            log("subido rowid=%d %s %s %s (%s)" % (row[0], row[6], row[5], row[4], answer.strip()[:120]))
-        elif "RESULT=AUTH" in answer:
-            # Key valida pero sin suscripcion QRZ (o sin permiso): no insistir cada 30 s.
-            log("QRZ sin permiso para INSERT (suscripcion QRZ): %s; reintento en 1 h"
-                % answer.strip()[:160])
-            write_cooldown(3600)
-            return sent
-        else:
-            log("QRZ rechazo rowid=%d: %s" % (row[0], answer.strip()[:200]))
-            return sent
+            log("%s: excepcion: %s" % (prov, e))
     return sent
 
 
 def status(conf):
     print("config: %s" % CONF)
-    print("  enabled=%s api_key=%s interval=%s" % (
-        conf.get("enabled"), ("*" * 8 + conf["api_key"][-4:]) if conf.get("api_key") else "(vacío)",
-        conf.get("interval")))
-    print("estado: %s ultimo rowid=%d red=%s" % (STATE, read_last_rowid(), "up" if network_up() else "down"))
-    rows = pending_rows(read_last_rowid())
-    print("pendientes: %d" % len(rows))
-    wait = read_cooldown()
-    if wait > 0:
-        print("cooldown: reintento en %d s (QRZ sin suscripcion)" % wait)
+    print("  enabled=%s interval=%s" % (cfg(conf, "enabled"), cfg(conf, "interval")))
+    for prov, key, _ in PROVIDERS:
+        state = "off"
+        if truthy(cfg(conf, key, "0")):
+            state = "on"
+        last = read_last_rowid(prov)
+        pend = len(pending_rows(last))
+        cool = read_cooldown(prov)
+        extra = ""
+        if cool:
+            extra = " cooldown=%d s" % cool
+        print("  %-8s %-3s ultimo_rowid=%-3d pendientes=%-3d%s" % (prov, state, last, pend, extra))
     if os.path.exists(LOG):
         print("ultimas lineas de %s:" % LOG)
         with open(LOG, errors="replace") as f:
-            for line in f.readlines()[-10:]:
+            for line in f.readlines()[-12:]:
                 print("  " + line.rstrip())
 
 
 def dump_adif():
     rows = pending_rows(0)
-    for row in rows:
-        adif = adif_for_row(row)
-        if adif is not None:
-            print(adif)
+    adif = adif_batch(rows)
+    if adif:
+        print(adif, end="")
 
 
 def main():
@@ -275,17 +431,17 @@ def main():
     if do_adif:
         dump_adif()
         return 0
-    enabled = conf.get("enabled", "1").lower() in ("1", "true", "yes", "si", "sí")
-    if not enabled:
+    if not truthy(cfg(conf, "enabled", "1")):
         log("deshabilitado por %s" % CONF)
         return 0
     if once:
-        return 0 if run_once(conf) >= 0 else 1
+        run_once(conf)
+        return 0
     if not loop:
         print(__doc__)
         return 2
     try:
-        interval = max(10, int(conf.get("interval", "30")))
+        interval = max(10, int(cfg(conf, "interval", "30")))
     except ValueError:
         interval = 30
     while True:
