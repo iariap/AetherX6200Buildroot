@@ -6,6 +6,7 @@
 #   qrz-upload.py --once     corre una pasada (para probar)
 #   qrz-upload.py --loop     queda en bucle (lo arranca /etc/init.d/S55qrz-upload)
 #   qrz-upload.py --status   muestra configuracion y estado sin subir nada
+#   qrz-upload.py --adif     imprime el ADIF de todos los QSO del log (subida manual)
 #
 # Configuracion: /mnt/qrz.conf  (se crea con la plantilla la primera vez)
 #   enabled=1
@@ -31,6 +32,7 @@ import urllib.request
 
 CONF = os.environ.get("QRZ_CONF", "/mnt/qrz.conf")
 STATE = os.environ.get("QRZ_STATE", "/mnt/qrz_upload.state")
+COOLDOWN = os.environ.get("QRZ_COOLDOWN", "/mnt/qrz_upload.cooldown")
 LOG = os.environ.get("QRZ_LOG", "/mnt/qrz-upload.log")
 DB = os.environ.get("QRZ_DB", "/mnt/qso_log.db")
 API = "https://logbook.qrz.com/api"
@@ -110,6 +112,23 @@ def write_last_rowid(rowid):
         log("no puedo escribir %s: %s" % (STATE, e))
 
 
+def read_cooldown():
+    """Segundos que faltan para reintentar (0 si toca ahora)."""
+    try:
+        with open(COOLDOWN) as f:
+            return max(0, int(f.read().strip() or "0") - int(time.time()))
+    except (OSError, ValueError):
+        return 0
+
+
+def write_cooldown(seconds):
+    try:
+        with open(COOLDOWN, "w") as f:
+            f.write(str(int(time.time()) + seconds))
+    except OSError as e:
+        log("no puedo escribir %s: %s" % (COOLDOWN, e))
+
+
 MODE_TO_ADIF = {1: "SSB", 2: "AM", 3: "FM", 4: "CW", 5: "FT8", 6: "JS8", 7: "FT4", 8: "RTTY"}
 
 
@@ -180,6 +199,9 @@ def run_once(conf):
     if not api_key:
         log("sin api_key en %s; no subo nada" % CONF)
         return 0
+    wait = read_cooldown()
+    if wait > 0:
+        return 0
     if not network_up():
         return 0
     last = read_last_rowid()
@@ -202,6 +224,12 @@ def run_once(conf):
             write_last_rowid(row[0])
             sent += 1
             log("subido rowid=%d %s %s %s (%s)" % (row[0], row[6], row[5], row[4], answer.strip()[:120]))
+        elif "RESULT=AUTH" in answer:
+            # Key valida pero sin suscripcion QRZ (o sin permiso): no insistir cada 30 s.
+            log("QRZ sin permiso para INSERT (suscripcion QRZ): %s; reintento en 1 h"
+                % answer.strip()[:160])
+            write_cooldown(3600)
+            return sent
         else:
             log("QRZ rechazo rowid=%d: %s" % (row[0], answer.strip()[:200]))
             return sent
@@ -216,6 +244,9 @@ def status(conf):
     print("estado: %s ultimo rowid=%d red=%s" % (STATE, read_last_rowid(), "up" if network_up() else "down"))
     rows = pending_rows(read_last_rowid())
     print("pendientes: %d" % len(rows))
+    wait = read_cooldown()
+    if wait > 0:
+        print("cooldown: reintento en %d s (QRZ sin suscripcion)" % wait)
     if os.path.exists(LOG):
         print("ultimas lineas de %s:" % LOG)
         with open(LOG, errors="replace") as f:
@@ -223,14 +254,26 @@ def status(conf):
                 print("  " + line.rstrip())
 
 
+def dump_adif():
+    rows = pending_rows(0)
+    for row in rows:
+        adif = adif_for_row(row)
+        if adif is not None:
+            print(adif)
+
+
 def main():
     args = sys.argv[1:]
     once = "--once" in args
     loop = "--loop" in args
     do_status = "--status" in args
+    do_adif = "--adif" in args
     conf = read_conf()
     if do_status:
         status(conf)
+        return 0
+    if do_adif:
+        dump_adif()
         return 0
     enabled = conf.get("enabled", "1").lower() in ("1", "true", "yes", "si", "sí")
     if not enabled:
