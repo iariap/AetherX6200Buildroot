@@ -1,8 +1,8 @@
 diff --git a/src/low/flow.c b/src/low/flow.c
-index 9d2e250..05df756 100644
+index 9d2e250..362a1c1 100644
 --- a/src/low/flow.c
 +++ b/src/low/flow.c
-@@ -11,25 +11,68 @@
+@@ -11,25 +11,81 @@
  #include "aether_radio/x6200_control/low/flow.h"
 
  #include <fcntl.h>
@@ -17,13 +17,26 @@ index 9d2e250..05df756 100644
 +/*
 + * RX framing for BASE 1.0.8.
 + *
-+ * BASE 1.0.6 and older send the legacy x6200_flow_t payload as a raw
-+ * contiguous 552-byte packet that starts with the 0xAA5555AA magic
-+ * ("RAW" framing).  BASE 1.0.8 (vendor APP 1.0.8) keeps the same 552-byte
-+ * payload but wraps it in SLIP: 0xC0 is the END delimiter, 0xC0 data bytes
++ * X6200Control v0.1.1 defines x6200_flow_t as a 552-byte ABI
++ * (uint8_t samples[512]).  This patch keeps the v0.1.1 RAW parser
++ * (contiguous 552-byte packet that starts with the 0xAA5555AA magic, vendor
++ * CRC32) and adds the SLIP decoder for the BASE 1.0.8 uplink, reconstructed
++ * from the vendor APP 1.0.8 static RE (iariap/x6200_gui#376 / PR #380 over
++ * an UNVERIFIED vendor payload): 0xC0 is the END delimiter, 0xC0 data bytes
 + * are escaped as 0xDB 0xDC and 0xDB data bytes as 0xDB 0xDD.  The vendor app
 + * checks the decoded length (exactly 552 bytes) and the vendor CRC32, and
 + * does *not* compare the magic field, so neither may the SLIP path here.
++ *
++ * SCOPE / NON-GOALS (important):
++ *  - RAW 552 bytes is the X6200Control v0.1.1 contract implemented by this
++ *    library.  It is NOT the wire format of the official BASE 1.0.6 APP
++ *    investigated by #376: that APP consumed 2088-byte RAW frames
++ *    (float samples[512], X6200Control v0.1.0 ABI).
++ *  - Physical backward compatibility with BASE 1.0.6 is
++ *    NOT_DEMONSTRATED / NOT_SUPPORTED / NOT_TESTED.  It would require the
++ *    2088-byte ABI and is out of scope for FAST-TRACK #377 (BASE 1.0.8).
++ *  - The host tests labelled "RAW legacy" use synthetic 552-byte v0.1.1
++ *    fixtures, not captures from a BASE 1.0.6 radio.
 + *
 + * The transport is selected by the first complete packet that validates
 + * (length + vendor CRC32, plus magic for RAW) and stays selected until
@@ -42,7 +55,7 @@ index 9d2e250..05df756 100644
 + *  - maximum SLIP wire length: 2 * sizeof(x6200_flow_t) + 1 bytes
 + *  - a decoded length different from 552 bytes is rejected
 + *  - a CRC mismatch rejects the packet; the payload is never modified to
-+ *    make it validate (the legacy previous-hkey retry is RAW only)
++ *    make it validate (the v0.1.1 previous-hkey retry is RAW only)
 + */
 
 -static int flow_fd;
@@ -62,16 +75,16 @@ index 9d2e250..05df756 100644
 +#define FLOW_SLIP_ESC 0xDBu
 +#define FLOW_SLIP_ESC_END 0xDCu
 +#define FLOW_SLIP_ESC_ESC 0xDDu
-+
+
+-static const uint32_t magic = 0xAA5555AA;
 +/* Upper bound of read() calls per x6200_flow_read() invocation.  This is a
 + * bounded catch-up, never a busy loop: it allows draining several buffered
 + * packets in a row, while guaranteeing the caller regains control. */
 +#define FLOW_READS_PER_CALL 4
 
--static const uint32_t magic = 0xAA5555AA;
-+static const uint8_t magic_bytes[FLOW_MAGIC_SIZE] = {0xAA, 0x55, 0x55, 0xAA};
-
 -static uint32_t crctab[256] = {
++static const uint8_t magic_bytes[FLOW_MAGIC_SIZE] = {0xAA, 0x55, 0x55, 0xAA};
++
 +static int flow_fd = -1;
 +
 +static uint32_t prev_hkey = 0;
@@ -80,7 +93,7 @@ index 9d2e250..05df756 100644
      0x00000000, 0x04c11db7, 0x09823b6e, 0x0d4326d9,
      0x130476dc, 0x17c56b6b, 0x1a864db2, 0x1e475005,
      0x2608edb8, 0x22c9f00f, 0x2f8ad6d6, 0x2b4bcb61,
-@@ -109,8 +152,107 @@ uint32_t calc_crc32(const uint32_t *data, uint16_t len)
+@@ -109,8 +165,107 @@ uint32_t calc_crc32(const uint32_t *data, uint16_t len)
 
      return crc;
  }
@@ -190,7 +203,7 @@ index 9d2e250..05df756 100644
 
      if (flow_fd < 0)
          return false;
-@@ -131,113 +273,260 @@ static bool open_flow_fd() {
+@@ -131,113 +286,264 @@ static bool open_flow_fd() {
      attr.c_lflag = attr.c_lflag & 0xffff7fb4;
  #endif
 
@@ -206,12 +219,16 @@ index 9d2e250..05df756 100644
 
 -bool x6200_flow_init()
 +/*
-+ * RAW framing: legacy v0.1.1 packet search.
++ * RAW framing: X6200Control v0.1.1 552-byte contract packet search.
 + *
 + * The candidate always starts with the magic.  Once 552 bytes are available
-+ * the packet is validated with the vendor CRC32, keeping the legacy
-+ * previous-hkey retry that v0.1.1 implemented.  Invalid candidates resync on
-+ * the next magic (possibly one already contained in the candidate).
++ * the packet is validated with the vendor CRC32, keeping the previous-hkey
++ * retry that v0.1.1 implemented.  Invalid candidates resync on the next
++ * magic (possibly one already contained in the candidate).
++ *
++ * This is the v0.1.1 SDK/library contract only.  It is not the official
++ * BASE 1.0.6 2088-byte ABI: physical compatibility with BASE 1.0.6 is
++ * NOT_DEMONSTRATED / NOT_SUPPORTED / NOT_TESTED (out of scope, #377).
 + */
 +static bool flow_raw_accept(flow_raw_t *raw, x6200_flow_t *pack)
  {
@@ -221,7 +238,7 @@ index 9d2e250..05df756 100644
 +    bool valid = flow_crc_matches(&raw->window);
 +
 +    if (!valid) {
-+        /* Legacy workaround, kept unchanged: a hkey change is retried with
++        /* v0.1.1 workaround, kept unchanged: a hkey change is retried with
 +         * the previous key of the last accepted packet.  RAW only. */
 +        flow_store_u32(raw->window.bytes + offsetof(x6200_flow_t, hkey), prev_hkey);
 +        valid = flow_crc_matches(&raw->window);
@@ -467,8 +484,9 @@ index 9d2e250..05df756 100644
 +
 +    if (!open_flow_fd()) {
 +        return false;
-+    }
-+
+     }
+
+-    int res = read(flow_fd, buf_write, sizeof(x6200_flow_t));
 +    return true;
 +}
 +
@@ -476,10 +494,9 @@ index 9d2e250..05df756 100644
 +    if (flow_fd >= 0) {
 +        close(flow_fd);
 +        flow_fd = -1;
-     }
++    }
 +    flow_state_reset();
-
--    int res = read(flow_fd, buf_write, sizeof(x6200_flow_t));
++
 +    usleep(10000);
 
 -    if (res > 0) {

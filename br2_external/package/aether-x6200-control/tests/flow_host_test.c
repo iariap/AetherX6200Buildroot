@@ -2,10 +2,14 @@
  * Host tests for the RX framing decoder of src/low/flow.c.
  *
  * Target: X6200 BASE 1.0.8 (vendor APP 1.0.8) sends the 552-byte
- * x6200_flow_t payload wrapped in SLIP; BASE 1.0.6 and older sent it as a
- * RAW magic-prefixed 552-byte packet.  The real flow.c from gdyuldin/
- * X6200Control v0.1.1 (patched with the RX SLIP decoder) is compiled into
- * this test against fake open/read/termios shims, so the parser and both
+ * x6200_flow_t payload wrapped in SLIP (contract reconstructed in
+ * iariap/x6200_gui#376 / PR #380 from an UNVERIFIED vendor payload).  The
+ * 552-byte RAW path kept by this library is the X6200Control v0.1.1
+ * contract, NOT the wire format of the official BASE 1.0.6 APP (which used a
+ * 2088-byte ABI, float samples[512]); physical BASE 1.0.6 compatibility is
+ * NOT_DEMONSTRATED / NOT_SUPPORTED / NOT_TESTED.  The real flow.c from
+ * gdyuldin/X6200Control v0.1.1 (patched with the RX SLIP decoder) is compiled
+ * into this test against fake open/read/termios shims, so the parser and both
  * transport paths are exercised for real.
  *
  * Fixtures: tests/fixtures/fixture2-{wire,payload}.hex are the synthetic
@@ -122,7 +126,7 @@ static void update_crc(packet_buf_t *packet)
     store_u32(packet->bytes + CRC_OFFSET, crc);
 }
 
-/* Deterministic synthetic payload in the legacy x6200_flow_t layout.  The
+/* Deterministic synthetic payload in the 552-byte x6200_flow_t v0.1.1 layout.  The
  * filler contains 0xC0 and 0xDB bytes on purpose, so its SLIP wire uses both
  * escapes. */
 static void fill_payload(packet_buf_t *packet, uint32_t magic, uint32_t hkey, unsigned seed)
@@ -404,7 +408,7 @@ static void test_slip_552_without_magic(void)
     size_t wire_length;
     x6200_flow_t pack;
 
-    /* BASE 1.0.8 must not require the legacy magic: the vendor APP does not
+    /* BASE 1.0.8 must not require the v0.1.1 magic constant: the vendor APP does not
      * compare it either.  The payload uses both SLIP escapes (filler). */
     fill_payload(&payload, MAGIC_OTHER, 0xC1, 3);
     wire_length = slip_encode(payload.bytes, PACKET_SIZE, wire);
@@ -652,6 +656,8 @@ static void test_slip_lock_and_no_raw_after(void)
     expect_frame(&pack, &slip_payload);
 }
 
+/* "RAW legacy" here means the X6200Control v0.1.1 552-byte RAW contract,
+ * not the official BASE 1.0.6 2088-byte ABI (see file header). */
 static void test_raw_legacy_552(void)
 {
     packet_buf_t payload_a;
@@ -738,7 +744,7 @@ static void test_raw_prev_hkey_legacy(void)
     expect_frame(&pack, &payload_b);
 
     /* Third packet: the CRC was computed over the previous hkey (v0.1.1
-     * legacy retry).  It must be accepted and the real hkey preserved. */
+     * v0.1.1 previous-hkey retry).  It must be accepted and the real hkey preserved. */
     fill_payload(&payload_c, MAGIC, hkey_c, 27);
     store_u32(payload_c.bytes + HKEY_OFFSET, hkey_b);
     update_crc(&payload_c); /* CRC over hkey_b */
