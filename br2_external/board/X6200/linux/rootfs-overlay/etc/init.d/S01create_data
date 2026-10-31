@@ -272,16 +272,19 @@ start() {
     [ "$data_bytes" = "$want_bytes" ] ||
         fail "$DATA is $data_bytes bytes, expected $want_bytes (partition 3 was not created as requested)"
 
-    # Only a partition with no signature at all is formatted: if something older
-    # shows up here, it is not ours and it stays untouched.
-    old_sig=""
+    # Only a partition with no FILESYSTEM is formatted. blkid on a bare
+    # partition (created a moment ago) can still succeed with only
+    # PARTUUID=... and no TYPE; that is not a filesystem and must not stop the
+    # mkfs. Any real type on this just-created p3 is foreign and stays untouched.
+    old_type=""
     rc=0
-    old_sig=$(blkid "$DATA" 2>/dev/null) || rc=$?
+    old_type=$(blkid -o value -s TYPE "$DATA" 2>/dev/null) || rc=$?
     case $rc in
-        2) ;;
-        0) fail "$DATA already carries a filesystem (${old_sig}): refusing to format it" ;;
+        0 | 2) ;;
         *) fail "cannot read $DATA (blkid exited $rc)" ;;
     esac
+    [ -z "$old_type" ] ||
+        fail "$DATA already carries a filesystem (${old_type}): refusing to format it"
 
     # mke2fs escribe su progreso en stdout: va a stderr para que stdout lleve solo
     # los mensajes de este script (el contrato pide "DATA ready (<tipo>)" ahi).
