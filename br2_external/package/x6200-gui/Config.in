@@ -2,7 +2,11 @@ config BR2_PACKAGE_X6200_GUI
 	bool "x6200_gui"
 	select BR2_PACKAGE_LIBPNG
 	select BR2_PACKAGE_AETHER_X6200_CONTROL
-	select BR2_PACKAGE_RHVOICE
+	select BR2_PACKAGE_SPEEXDSP
+	select BR2_PACKAGE_LIQUID_DSP
 	select BR2_PACKAGE_FT8LIB
 	help
 	  X6200 GUI application
+
+	  TTS (RHVoice) and GPS (gpsd) were removed for power savings,
+	  see docs/TRD.md.

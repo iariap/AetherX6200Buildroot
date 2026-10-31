@@ -1,0 +1,5 @@
+# -n: no detach, systemd-style notification
+# -C: compat mode (keeps the SDP server socket), needed by `sdptool add` for the
+#     SPP record that btcat publishes for Bluetooth CAT clients.
+# Ported from the X6100 firmware by IU1WXY.
+BLUETOOTHD_ARGS="-n -C"

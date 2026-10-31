@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# QRZ Logbook uploader: sube los QSO nuevos al logbook cuando hay WiFi.
+# Configuracion en /mnt/qrz.conf (se crea la plantilla en el primer arranque).
+#
+DAEMON=/usr/share/x6200/qrz-upload.py
+PIDFILE=/var/run/qrz-upload.pid
+
+case "$1" in
+    start)
+        printf "Starting QRZ uploader: "
+        start-stop-daemon -S -b -q -m -p "$PIDFILE" -x /usr/bin/python3 -- "$DAEMON" --loop
+        [ $? -eq 0 ] && echo "OK" || echo "FAIL"
+        ;;
+    stop)
+        printf "Stopping QRZ uploader: "
+        start-stop-daemon -K -q -p "$PIDFILE"
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

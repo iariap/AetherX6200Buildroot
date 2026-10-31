@@ -6,6 +6,8 @@
 DAEMON="x6100_webserver"
 PIDFILE="/var/run/$DAEMON.pid"
 ARGS="--db /mnt/params.db --host 0.0.0.0 --port 80 --filebrowser-path /mnt/"
+# HTTPS con certificado autofirmado (se genera con openssl la primera vez)
+ARGS="$ARGS --https-port 443 --cert-dir /mnt/https"
 
 start() {
 	printf "Starting $DAEMON: "
