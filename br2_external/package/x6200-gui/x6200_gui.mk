@@ -4,8 +4,8 @@
 #
 ################################################################################
 
-X6200_GUI_VERSION = v0.1.0
-X6200_GUI_SITE = https://github.com/gdyuldin/x6200_gui
+X6200_GUI_VERSION = 57f671e879fc42919eaa0add46bf844680cfa2b1
+X6200_GUI_SITE = https://github.com/iariap/x6200_gui.git
 X6200_GUI_SITE_METHOD = git
 X6200_GUI_GIT_SUBMODULES = YES
 X6200_GUI_LICENSE = GPLv2
