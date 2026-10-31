@@ -1,0 +1,537 @@
+diff --git a/src/low/flow.c b/src/low/flow.c
+index 9d2e250..362a1c1 100644
+--- a/src/low/flow.c
++++ b/src/low/flow.c
+@@ -11,25 +11,81 @@
+ #include "aether_radio/x6200_control/low/flow.h"
+
+ #include <fcntl.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+ #include <stddef.h>
+ #include <string.h>
+ #include <termios.h>
+ #include <unistd.h>
+
+-#define BUF_SIZE (sizeof(x6200_flow_t) * 3)
++/*
++ * RX framing for BASE 1.0.8.
++ *
++ * X6200Control v0.1.1 defines x6200_flow_t as a 552-byte ABI
++ * (uint8_t samples[512]).  This patch keeps the v0.1.1 RAW parser
++ * (contiguous 552-byte packet that starts with the 0xAA5555AA magic, vendor
++ * CRC32) and adds the SLIP decoder for the BASE 1.0.8 uplink, reconstructed
++ * from the vendor APP 1.0.8 static RE (iariap/x6200_gui#376 / PR #380 over
++ * an UNVERIFIED vendor payload): 0xC0 is the END delimiter, 0xC0 data bytes
++ * are escaped as 0xDB 0xDC and 0xDB data bytes as 0xDB 0xDD.  The vendor app
++ * checks the decoded length (exactly 552 bytes) and the vendor CRC32, and
++ * does *not* compare the magic field, so neither may the SLIP path here.
++ *
++ * SCOPE / NON-GOALS (important):
++ *  - RAW 552 bytes is the X6200Control v0.1.1 contract implemented by this
++ *    library.  It is NOT the wire format of the official BASE 1.0.6 APP
++ *    investigated by #376: that APP consumed 2088-byte RAW frames
++ *    (float samples[512], X6200Control v0.1.0 ABI).
++ *  - Physical backward compatibility with BASE 1.0.6 is
++ *    NOT_DEMONSTRATED / NOT_SUPPORTED / NOT_TESTED.  It would require the
++ *    2088-byte ABI and is out of scope for FAST-TRACK #377 (BASE 1.0.8).
++ *  - The host tests labelled "RAW legacy" use synthetic 552-byte v0.1.1
++ *    fixtures, not captures from a BASE 1.0.6 radio.
++ *
++ * The transport is selected by the first complete packet that validates
++ * (length + vendor CRC32, plus magic for RAW) and stays selected until
++ * x6200_flow_restart().  A single stray 0xC0 never selects SLIP; only a
++ * complete SLIP frame with a valid CRC can.  When the first packet is an
++ * unescaped SLIP frame whose 552 payload bytes also pass the RAW checks,
++ * the following wire byte (END for SLIP, next magic for RAW) disambiguates.
++ *
++ * Parsing is incremental and only uses fixed buffers: no allocation or
++ * reallocation per frame, no busy loops, no logging.  A packet may be split
++ * across any number of read() calls and several packets may arrive in a
++ * single read().
++ *
++ * LIMITS:
++ *  - decoded packet buffer: sizeof(x6200_flow_t) (552 bytes)
++ *  - maximum SLIP wire length: 2 * sizeof(x6200_flow_t) + 1 bytes
++ *  - a decoded length different from 552 bytes is rejected
++ *  - a CRC mismatch rejects the packet; the payload is never modified to
++ *    make it validate (the v0.1.1 previous-hkey retry is RAW only)
++ */
+
+-static int flow_fd;
++#define FLOW_PACKET_SIZE ((size_t) sizeof(x6200_flow_t))
++#define FLOW_PACKET_WORDS (sizeof(x6200_flow_t) / sizeof(uint32_t))
++#define FLOW_PACKET_CRC_WORDS (FLOW_PACKET_WORDS - 1)
+
+-static uint8_t *buf = NULL;
+-static uint8_t *buf_write = NULL;
++#define FLOW_MAGIC 0xAA5555AAu
++#define FLOW_MAGIC_SIZE 4
+
+-static uint32_t prev_hkey = 0;
++#define FLOW_WIRE_MAX (2 * FLOW_PACKET_SIZE + 1)
++
++#define FLOW_SLIP_END 0xC0u
++#define FLOW_SLIP_ESC 0xDBu
++#define FLOW_SLIP_ESC_END 0xDCu
++#define FLOW_SLIP_ESC_ESC 0xDDu
+
+-static const uint32_t magic = 0xAA5555AA;
++/* Upper bound of read() calls per x6200_flow_read() invocation.  This is a
++ * bounded catch-up, never a busy loop: it allows draining several buffered
++ * packets in a row, while guaranteeing the caller regains control. */
++#define FLOW_READS_PER_CALL 4
+
+-static uint32_t crctab[256] = {
++static const uint8_t magic_bytes[FLOW_MAGIC_SIZE] = {0xAA, 0x55, 0x55, 0xAA};
++
++static int flow_fd = -1;
++
++static uint32_t prev_hkey = 0;
++
++static const uint32_t crctab[256] = {
+     0x00000000, 0x04c11db7, 0x09823b6e, 0x0d4326d9,
+     0x130476dc, 0x17c56b6b, 0x1a864db2, 0x1e475005,
+     0x2608edb8, 0x22c9f00f, 0x2f8ad6d6, 0x2b4bcb61,
+@@ -109,8 +165,107 @@ uint32_t calc_crc32(const uint32_t *data, uint16_t len)
+
+     return crc;
+ }
+-static bool open_flow_fd() {
+-    flow_fd = open("/dev/ttyS1", O_RDWR | O_NONBLOCK| O_NOCTTY);
++
++typedef enum
++{
++    FLOW_MODE_AUTO = 0,
++    FLOW_MODE_RAW,
++    FLOW_MODE_SLIP,
++} flow_mode_t;
++
++/* Staging buffer for one packet: byte view for the wire/decoded payload and
++ * word view for the legacy word-at-a-time CRC (no unaligned casts needed). */
++typedef union
++{
++    uint32_t words[FLOW_PACKET_WORDS];
++    uint8_t bytes[FLOW_PACKET_SIZE];
++} flow_packet_buf_t;
++
++typedef struct
++{
++    flow_packet_buf_t window;
++    size_t length;
++    uint32_t history;
++    unsigned history_len;
++} flow_raw_t;
++
++typedef struct
++{
++    flow_packet_buf_t payload;
++    size_t length;
++    size_t wire_length;
++    bool escape;
++    bool discard;
++} flow_slip_t;
++
++typedef struct
++{
++    flow_mode_t mode;
++
++    flow_raw_t raw;
++    flow_slip_t slip;
++
++    /* First RAW-validated packet: if the very next wire byte is an END, the
++     * packet was actually an unescaped SLIP frame (both framings decode to
++     * the same 552 bytes) and the transport is fixed to SLIP.  RAW streams
++     * always send the next packet's magic first, so that byte disambiguates. */
++    bool raw_pending;
++
++    uint8_t rx[FLOW_WIRE_MAX];
++    size_t rx_length;
++    size_t rx_pos;
++} flow_rx_t;
++
++static flow_rx_t flow_rx;
++
++static uint32_t flow_load_u32(const void *ptr)
++{
++    uint32_t value;
++
++    memcpy(&value, ptr, sizeof(value));
++    return value;
++}
++
++static void flow_store_u32(void *ptr, uint32_t value)
++{
++    memcpy(ptr, &value, sizeof(value));
++}
++
++static bool flow_crc_matches(const flow_packet_buf_t *packet)
++{
++    uint32_t packet_crc = flow_load_u32(packet->bytes + offsetof(x6200_flow_t, crc));
++
++    return packet_crc == calc_crc32(packet->words, FLOW_PACKET_CRC_WORDS);
++}
++
++static void flow_slip_reset(flow_slip_t *slip)
++{
++    slip->length = 0;
++    slip->wire_length = 0;
++    slip->escape = false;
++    slip->discard = false;
++}
++
++static void flow_raw_reset(flow_raw_t *raw)
++{
++    raw->length = 0;
++    raw->history = 0;
++    raw->history_len = 0;
++}
++
++static void flow_state_reset()
++{
++    flow_rx.mode = FLOW_MODE_AUTO;
++    flow_rx.raw_pending = false;
++    flow_raw_reset(&flow_rx.raw);
++    flow_slip_reset(&flow_rx.slip);
++    flow_rx.rx_length = 0;
++    flow_rx.rx_pos = 0;
++}
++
++static bool open_flow_fd()
++{
++    flow_fd = open("/dev/ttyS1", O_RDWR | O_NONBLOCK | O_NOCTTY);
+
+     if (flow_fd < 0)
+         return false;
+@@ -131,113 +286,264 @@ static bool open_flow_fd() {
+     attr.c_lflag = attr.c_lflag & 0xffff7fb4;
+ #endif
+
+-    if (tcsetattr(flow_fd, 0, &attr) < 0)
+-    {
++    if (tcsetattr(flow_fd, 0, &attr) < 0) {
+         close(flow_fd);
++        flow_fd = -1;
+         return false;
+     }
+     return true;
+ }
+
+-bool x6200_flow_init()
++/*
++ * RAW framing: X6200Control v0.1.1 552-byte contract packet search.
++ *
++ * The candidate always starts with the magic.  Once 552 bytes are available
++ * the packet is validated with the vendor CRC32, keeping the previous-hkey
++ * retry that v0.1.1 implemented.  Invalid candidates resync on the next
++ * magic (possibly one already contained in the candidate).
++ *
++ * This is the v0.1.1 SDK/library contract only.  It is not the official
++ * BASE 1.0.6 2088-byte ABI: physical compatibility with BASE 1.0.6 is
++ * NOT_DEMONSTRATED / NOT_SUPPORTED / NOT_TESTED (out of scope, #377).
++ */
++static bool flow_raw_accept(flow_raw_t *raw, x6200_flow_t *pack)
+ {
+-    if (!open_flow_fd()) {
+-        return false;
++    uint32_t hkey = flow_load_u32(raw->window.bytes + offsetof(x6200_flow_t, hkey));
++    bool valid = flow_crc_matches(&raw->window);
++
++    if (!valid) {
++        /* v0.1.1 workaround, kept unchanged: a hkey change is retried with
++         * the previous key of the last accepted packet.  RAW only. */
++        flow_store_u32(raw->window.bytes + offsetof(x6200_flow_t, hkey), prev_hkey);
++        valid = flow_crc_matches(&raw->window);
++        flow_store_u32(raw->window.bytes + offsetof(x6200_flow_t, hkey), hkey);
+     }
+-    buf = malloc(BUF_SIZE);
+-    buf_write = buf;
+
++    if (!valid)
++        return false;
++
++    memcpy((void *) pack, (void *) raw->window.bytes, FLOW_PACKET_SIZE);
++    pack->hkey = hkey;
++    prev_hkey = hkey;
+     return true;
+ }
+
+-AETHER_X6200CTRL_API bool x6200_flow_restart() {
+-    close(flow_fd);
+-    buf_write = buf;
++static bool flow_raw_update(flow_raw_t *raw, uint8_t byte, x6200_flow_t *pack)
++{
++    if (raw->length == 0) {
++        raw->history = (raw->history << 8) | byte;
++        if (raw->history_len < FLOW_MAGIC_SIZE)
++            raw->history_len++;
++
++        if (raw->history_len == FLOW_MAGIC_SIZE && raw->history == FLOW_MAGIC) {
++            flow_store_u32(raw->window.bytes, FLOW_MAGIC);
++            raw->length = FLOW_MAGIC_SIZE;
++            raw->history = 0;
++            raw->history_len = 0;
++        }
++        return false;
++    }
+
+-    usleep(10000);
++    raw->window.bytes[raw->length++] = byte;
+
+-    return open_flow_fd();
+-}
++    if (raw->length < FLOW_PACKET_SIZE)
++        return false;
+
+-static bool flow_check(x6200_flow_t *pack)
+-{
+-    uint32_t crc;
+-    uint32_t hkey;
+-    uint32_t pack_crc;
+-    uint8_t *begin;
++    if (flow_raw_accept(raw, pack)) {
++        flow_raw_reset(raw);
++        return true;
++    }
+
+-    size_t hkey_offset = offsetof(x6200_flow_t, hkey);
+-    size_t crc_offset = offsetof(x6200_flow_t, crc);
++    /* Invalid candidate: restart on the next magic inside the window. */
++    uint8_t *next = memmem(raw->window.bytes + 1, FLOW_PACKET_SIZE - 1, magic_bytes, sizeof(magic_bytes));
+
+-    uint8_t* read_ptr = buf;
++    if (next != NULL) {
++        size_t shift = (size_t) (next - raw->window.bytes);
+
+-    bool result = false;
+-    while ((buf_write - read_ptr) >= sizeof(x6200_flow_t)) {
+-        begin = memmem(read_ptr, buf_write - read_ptr, &magic, sizeof(magic));
++        memmove(raw->window.bytes, next, FLOW_PACKET_SIZE - shift);
++        raw->length = FLOW_PACKET_SIZE - shift;
++        return false;
++    }
+
+-        if (begin == NULL) {
+-            read_ptr = buf_write - sizeof(magic);
+-            break;
+-        }
+-        if ((buf_write - begin) < sizeof(x6200_flow_t)) {
+-            read_ptr = begin;
++    raw->length = 0;
++
++    /* Keep a trailing partial magic, it may be completed by the next byte. */
++    for (unsigned keep = FLOW_MAGIC_SIZE - 1; keep >= 1; keep--) {
++        const uint8_t *tail = raw->window.bytes + FLOW_PACKET_SIZE - keep;
++
++        if (memcmp(tail, magic_bytes, keep) == 0) {
++            for (unsigned i = 0; i < keep; i++)
++                raw->history = (raw->history << 8) | tail[i];
++            raw->history_len = keep;
+             break;
+         }
++    }
++    return false;
++}
+
+-        hkey = *(uint32_t*)(begin + hkey_offset);
+-        pack_crc = *(uint32_t*)(begin + crc_offset);
++/*
++ * SLIP framing: strict incremental decoder.
++ *
++ * END closes a frame; DB DC decodes to C0; DB DD decodes to DB; an illegal
++ * or orphan escape discards the frame up to END; an empty END is ignored; a
++ * decoded length different from 552 bytes or a bad CRC rejects the frame.
++ * Nothing is ever written to the caller's packet unless it fully validates.
++ */
++static void flow_slip_append(flow_slip_t *slip, uint8_t byte)
++{
++    if (slip->length >= FLOW_PACKET_SIZE) {
++        slip->discard = true;
++        return;
++    }
++    slip->payload.bytes[slip->length++] = byte;
++}
+
+-        crc = calc_crc32((const uint32_t*)begin, sizeof(x6200_flow_t) / 4 - 1);
++static bool flow_slip_update(flow_slip_t *slip, uint8_t byte, x6200_flow_t *pack)
++{
++    if (slip->discard) {
++        if (byte == FLOW_SLIP_END)
++            flow_slip_reset(slip);
++        return false;
++    }
+
+-        if (pack_crc == crc) {
+-            result = true;
++    if (slip->wire_length == FLOW_WIRE_MAX) {
++        /* Too long to be a valid frame: drop it and resync on END. */
++        slip->discard = true;
++        if (byte == FLOW_SLIP_END)
++            flow_slip_reset(slip);
++        return false;
++    }
++    slip->wire_length++;
++
++    if (slip->escape) {
++        slip->escape = false;
++
++        if (byte == FLOW_SLIP_ESC_END) {
++            flow_slip_append(slip, FLOW_SLIP_END);
++        } else if (byte == FLOW_SLIP_ESC_ESC) {
++            flow_slip_append(slip, FLOW_SLIP_ESC);
++        } else if (byte == FLOW_SLIP_END) {
++            /* Orphan/illegal escape: this END also terminates the frame. */
++            flow_slip_reset(slip);
+         } else {
+-            // Try use previous hkey
+-            *(uint32_t*)(begin + hkey_offset) = prev_hkey;
+-            crc = calc_crc32((const uint32_t*)begin, sizeof(x6200_flow_t) / 4 - 1);
+-            if (pack_crc == crc) {
+-                result = true;
+-            }
++            /* Illegal escape: discard until END. */
++            slip->discard = true;
+         }
++        return false;
++    }
+
+-        if (!result) {
+-            read_ptr = begin + 3;
++    if (byte == FLOW_SLIP_END) {
++        bool valid = slip->length == FLOW_PACKET_SIZE && flow_crc_matches(&slip->payload);
+
+-        } else {
+-            memcpy((void *) pack, (void *) begin, sizeof(x6200_flow_t));
+-            pack->hkey = hkey;
+-            read_ptr = begin + sizeof(x6200_flow_t);
+-            prev_hkey = hkey;
+-            break;
++        if (valid)
++            memcpy((void *) pack, (void *) slip->payload.bytes, FLOW_PACKET_SIZE);
++        flow_slip_reset(slip);
++        return valid;
++    }
++
++    if (byte == FLOW_SLIP_ESC) {
++        slip->escape = true;
++        return false;
++    }
++
++    flow_slip_append(slip, byte);
++    return false;
++}
++
++static bool flow_feed_byte(uint8_t byte, x6200_flow_t *pack)
++{
++    switch (flow_rx.mode) {
++    case FLOW_MODE_RAW:
++        return flow_raw_update(&flow_rx.raw, byte, pack);
++
++    case FLOW_MODE_SLIP:
++        return flow_slip_update(&flow_rx.slip, byte, pack);
++
++    case FLOW_MODE_AUTO:
++    default:
++        break;
++    }
++
++    if (flow_rx.raw_pending) {
++        flow_rx.raw_pending = false;
++
++        if (byte == FLOW_SLIP_END) {
++            /* The validated packet was an unescaped SLIP frame.  Its END
++             * closes it; no packet is lost (both decodings are identical). */
++            flow_rx.mode = FLOW_MODE_SLIP;
++            flow_slip_reset(&flow_rx.slip);
++            return false;
+         }
++
++        flow_rx.mode = FLOW_MODE_RAW;
++        return flow_raw_update(&flow_rx.raw, byte, pack);
++    }
++
++    /* SLIP is tested first: a complete SLIP frame is a stronger signal (exact
++     * length + CRC of the decoded payload) than a RAW window match. */
++    if (flow_slip_update(&flow_rx.slip, byte, pack)) {
++        flow_rx.mode = FLOW_MODE_SLIP;
++        flow_raw_reset(&flow_rx.raw);
++        return true;
+     }
+
+-    if (read_ptr < buf_write) {
+-        uint16_t tail_len = buf_write - read_ptr;
+-        memmove(buf, read_ptr, tail_len);
+-        buf_write = buf + tail_len;
++    if (flow_raw_update(&flow_rx.raw, byte, pack)) {
++        flow_rx.raw_pending = true;
++        return true;
+     }
+-    return result;
++
++    return false;
+ }
+
+-bool x6200_flow_read(x6200_flow_t *pack)
++bool x6200_flow_init()
+ {
+-    size_t buf_space = buf + BUF_SIZE - buf_write;
+-    size_t buf_used = buf_write - buf;
+-    if (buf_space < sizeof(x6200_flow_t)) {
+-        size_t shift = sizeof(x6200_flow_t) - buf_space;
+-        memmove(buf, buf + shift, buf_used - shift);
+-        buf_write -= shift;
++    flow_state_reset();
++
++    if (!open_flow_fd()) {
++        return false;
+     }
+
+-    int res = read(flow_fd, buf_write, sizeof(x6200_flow_t));
++    return true;
++}
++
++AETHER_X6200CTRL_API bool x6200_flow_restart() {
++    if (flow_fd >= 0) {
++        close(flow_fd);
++        flow_fd = -1;
++    }
++    flow_state_reset();
++
++    usleep(10000);
+
+-    if (res > 0) {
+-        buf_write += res;
++    return open_flow_fd();
++}
+
+-        if ((buf_write - buf) > sizeof(x6200_flow_t)) {
+-            return flow_check(pack);
++bool x6200_flow_read(x6200_flow_t *pack)
++{
++    for (unsigned reads = 0; reads < FLOW_READS_PER_CALL; reads++) {
++        while (flow_rx.rx_pos < flow_rx.rx_length) {
++            uint8_t byte = flow_rx.rx[flow_rx.rx_pos++];
++
++            if (flow_feed_byte(byte, pack)) {
++                size_t left = flow_rx.rx_length - flow_rx.rx_pos;
++
++                if (left > 0)
++                    memmove(flow_rx.rx, flow_rx.rx + flow_rx.rx_pos, left);
++                flow_rx.rx_length = left;
++                flow_rx.rx_pos = 0;
++                return true;
++            }
+         }
++
++        flow_rx.rx_length = 0;
++        flow_rx.rx_pos = 0;
++
++        ssize_t got = read(flow_fd, flow_rx.rx, sizeof(flow_rx.rx));
++
++        if (got <= 0)
++            return false;
++
++        flow_rx.rx_length = (size_t) got;
+     }
+
+     return false;
